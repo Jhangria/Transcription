@@ -1,17 +1,31 @@
 import React, { useState, useEffect } from "react";
-import { View, Text, TouchableOpacity, Animated, Easing, StyleSheet } from "react-native";
+import {
+  View,
+  Text,
+  TouchableOpacity,
+  Animated,
+  Easing,
+  StyleSheet,
+  FlatList,
+  ScrollView,
+} from "react-native";
 import { Audio } from "expo-av";
+import { RNS3 } from "react-native-aws3";
+import AWS from "aws-sdk";
+import { AWS_CONFIG } from "../../aws-config";
 
 const ExploreScreen = () => {
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
-  const [audioUri, setAudioUri] = useState<string | null>(null);
-  const [sound, setSound] = useState<Audio.Sound | null>(null);
+  const [recordings, setRecordings] = useState<string[]>([]);
+  const [transcriptions, setTranscriptions] = useState<string[]>([]);
   const [recordTime, setRecordTime] = useState(0);
-  const pulseAnim = useState(new Animated.Value(1))[0]; // Pulsating effect
-  const opacityAnim = useState(new Animated.Value(0.6))[0]; // Fade effect
+  const [isTranscribing, setIsTranscribing] = useState(false);
+
+  const pulseAnim = useState(new Animated.Value(1))[0];
+  const opacityAnim = useState(new Animated.Value(0.6))[0];
 
   useEffect(() => {
-    let timer: NodeJS.Timeout | null = null; // Properly initialized timer variable
+    let timer: NodeJS.Timeout | null = null;
 
     if (recording) {
       timer = setInterval(() => {
@@ -62,12 +76,6 @@ const ExploreScreen = () => {
     ).start();
   };
 
-  const formatTime = (seconds: number) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins}:${secs < 10 ? "0" : ""}${secs}`;
-  };
-
   const startRecording = async () => {
     try {
       const { status } = await Audio.requestPermissionsAsync();
@@ -87,7 +95,7 @@ const ExploreScreen = () => {
       );
 
       setRecording(recording);
-      setRecordTime(0); // Reset timer on new recording
+      setRecordTime(0);
     } catch (err) {
       console.error("Failed to start recording", err);
     }
@@ -98,109 +106,213 @@ const ExploreScreen = () => {
 
     await recording.stopAndUnloadAsync();
     const uri = recording.getURI();
-    setAudioUri(uri);
+
+    if (uri) {
+      setRecordings((prev) => [uri, ...prev]);
+
+      const file = {
+        uri,
+        name: `recording-${new Date().toISOString()}.mp4`,
+        type: "audio/mp4",
+      };
+
+      const options = {
+        keyPrefix: "recordings/",
+        bucket: "my-transcription-app", // exactly this name
+        region: "us-east-2",             // your S3 region
+        accessKey: "YOUR_ACCESS_KEY",
+        secretKey: "YOUR_SECRET_KEY",
+        successActionStatus: 201,
+        awsUrl: "https://s3.us-east-2.amazonaws.com",
+        };
+
+      RNS3.put(file, options)
+        .then((response: any) => {
+          if (response.status === 201) {
+            console.log("Upload success", response.body);
+            startTranscription(response.body.postResponse.location);
+          } else {
+            console.error("Upload failed", response);
+          }
+        })
+        .catch((error: any) => console.error("Upload error:", error));
+    }
+
     setRecording(null);
   };
 
-  const playRecording = async () => {
-    if (!audioUri) return;
+  const startTranscription = async (audioUrl: string) => {
+    setIsTranscribing(true);
 
-    const { sound } = await Audio.Sound.createAsync({ uri: audioUri });
-    setSound(sound);
-    await sound.playAsync();
+    AWS.config.update({
+      accessKeyId: AWS_CONFIG.accessKeyId,
+      secretAccessKey: AWS_CONFIG.secretAccessKey,
+      region: AWS_CONFIG.region,
+    });
+
+    const transcribeService = new AWS.TranscribeService();
+    const jobName = `Transcription-${Date.now()}`;
+
+    const params: AWS.TranscribeService.StartTranscriptionJobRequest = {
+      TranscriptionJobName: jobName,
+      Media: { MediaFileUri: audioUrl },
+      MediaFormat: "mp4",
+      LanguageCode: "en-US",
+    };
+
+    try {
+      await transcribeService.startTranscriptionJob(params).promise();
+      console.log("Transcription started...");
+      checkTranscriptionStatus(jobName);
+    } catch (error) {
+      console.error("Error starting transcription:", error);
+      setIsTranscribing(false);
+    }
+  };
+
+  const checkTranscriptionStatus = async (jobName: string) => {
+    const transcribeService = new AWS.TranscribeService();
+
+    try {
+      const response = await transcribeService
+        .getTranscriptionJob({ TranscriptionJobName: jobName })
+        .promise();
+
+      const transcriptFileUri =
+        response.TranscriptionJob?.Transcript?.TranscriptFileUri;
+
+      if (
+        response.TranscriptionJob &&
+        response.TranscriptionJob.TranscriptionJobStatus === "COMPLETED" &&
+        transcriptFileUri
+      ) {
+        console.log("Transcription complete:", transcriptFileUri);
+        downloadTranscription(transcriptFileUri);
+      } else if (
+        response.TranscriptionJob?.TranscriptionJobStatus === "FAILED"
+      ) {
+        console.error("Transcription failed.");
+        setIsTranscribing(false);
+      } else {
+        console.log("Still processing...");
+        setTimeout(() => checkTranscriptionStatus(jobName), 4000);
+      }
+    } catch (error) {
+      console.error("Error checking transcription:", error);
+      setIsTranscribing(false);
+    }
+  };
+
+  const downloadTranscription = async (transcriptUrl: string) => {
+    try {
+      const response = await fetch(transcriptUrl);
+      const data = await response.json();
+      const transcriptionText = data.results.transcripts[0]?.transcript;
+      if (transcriptionText) {
+        setTranscriptions((prev) => [transcriptionText, ...prev]);
+      }
+    } catch (error) {
+      console.error("Error downloading transcript:", error);
+    } finally {
+      setIsTranscribing(false);
+    }
   };
 
   return (
-    <View style={styles.container}>
+    <ScrollView contentContainerStyle={styles.container}>
       <Text style={styles.title}>🎙️ Voice Recorder</Text>
 
-      {/* Pulsating Background */}
-      <View style={styles.recordContainer}>
-        <Animated.View
-          style={[
-            styles.pulseEffect,
-            recording && {
-              transform: [{ scale: pulseAnim }],
-              opacity: opacityAnim,
-            },
-          ]}
-        />
-        {/* Floating Record Button with Timer */}
-        <TouchableOpacity
-          style={[styles.recordButton, recording && styles.recording]}
-          onPress={recording ? stopRecording : startRecording}
-        >
-          <Text style={styles.timerText}>{recording ? formatTime(recordTime) : "Start"}</Text>
-        </TouchableOpacity>
-      </View>
+      <TouchableOpacity
+        onPress={recording ? stopRecording : startRecording}
+        style={[
+          styles.recordButton,
+          { backgroundColor: recording ? "#FF3B30" : "#4CAF50" },
+        ]}
+      >
+        <Text style={styles.recordText}>
+          {recording ? "Stop Recording" : "Start Recording"}
+        </Text>
+      </TouchableOpacity>
 
-      {/* Play Recording Button */}
-      {audioUri && (
-        <TouchableOpacity style={styles.playButton} onPress={playRecording}>
-          <Text style={styles.playText}>▶️ Play Recording</Text>
-        </TouchableOpacity>
+      {recording && (
+        <Text style={styles.timer}>Recording: {recordTime}s</Text>
       )}
-    </View>
+
+      {isTranscribing && (
+        <Text style={styles.transcribing}>Transcribing your audio...</Text>
+      )}
+
+      {transcriptions.length > 0 && (
+        <>
+          <Text style={styles.subtitle}>📝 Transcriptions</Text>
+          <FlatList
+            data={transcriptions}
+            renderItem={({ item }) => (
+              <View style={styles.transcriptionBox}>
+                <Text style={styles.transcriptionText}>{item}</Text>
+              </View>
+            )}
+            keyExtractor={(item, index) => index.toString()}
+          />
+        </>
+      )}
+    </ScrollView>
   );
 };
 
 const styles = StyleSheet.create({
   container: {
-    flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
-    backgroundColor: "#1E1E1E", // Dark background
+    paddingTop: 80,
+    paddingBottom: 50,
+    paddingHorizontal: 20,
+    backgroundColor: "#121212",
+    flexGrow: 1,
   },
   title: {
-    fontSize: 24,
+    fontSize: 26,
     fontWeight: "bold",
+    color: "#FF3B30",
+    textAlign: "center",
+    marginBottom: 30,
+  },
+  subtitle: {
+    fontSize: 20,
     color: "#ffffff",
-    marginBottom: 50,
-  },
-  recordContainer: {
-    justifyContent: "center",
-    alignItems: "center",
-    position: "relative",
-  },
-  pulseEffect: {
-    position: "absolute",
-    width: 120,
-    height: 120,
-    borderRadius: 60,
-    backgroundColor: "rgba(255, 0, 0, 0.4)", // Soft red glow
+    marginVertical: 10,
+    fontWeight: "600",
   },
   recordButton: {
-    width: 80,
-    height: 80,
-    borderRadius: 40,
-    backgroundColor: "#FF3B30",
-    justifyContent: "center",
-    alignItems: "center",
-    elevation: 10, // Android shadow
-    shadowColor: "#FF3B30",
-    shadowOffset: { width: 0, height: 10 },
-    shadowOpacity: 0.4,
-    shadowRadius: 20,
-  },
-  recording: {
-    backgroundColor: "#FF6B6B",
-  },
-  playButton: {
-    backgroundColor: "#457B9D",
     paddingVertical: 15,
     paddingHorizontal: 25,
     borderRadius: 10,
-    marginTop: 30,
+    alignSelf: "center",
   },
-  playText: {
+  recordText: {
     fontSize: 18,
     color: "#fff",
     fontWeight: "bold",
   },
-  timerText: {
+  timer: {
+    color: "#ffffff",
+    textAlign: "center",
     fontSize: 16,
+    marginTop: 10,
+  },
+  transcribing: {
+    fontStyle: "italic",
+    color: "#aaa",
+    textAlign: "center",
+    marginVertical: 20,
+  },
+  transcriptionBox: {
+    backgroundColor: "#1e1e1e",
+    padding: 15,
+    borderRadius: 10,
+    marginBottom: 10,
+  },
+  transcriptionText: {
     color: "#fff",
-    fontWeight: "bold",
+    fontSize: 16,
   },
 });
 
